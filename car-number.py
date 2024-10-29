@@ -2,78 +2,80 @@ from inference_sdk import InferenceHTTPClient
 import cv2
 import numpy as np
 
-def add_logo_to_license_plates(car_image_path, logo_image_path, output_image_path, model_id="vehicle-registration-plates-trudk/2", padding=5, border_thickness=3):
+def add_overlay_only(car_image_path, output_image_path, logo_path):
     CLIENT = InferenceHTTPClient(
-        api_url="https://detect.roboflow.com",
+        api_url="https://outline.roboflow.com",
         api_key="mb7m4Bcuxtbp5gAuPR0j"
     )
 
-    car_image = cv2.imread(car_image_path)
-    if car_image is None:
-        print(f"Error: Could not load image {car_image_path}")
-        return
-
-    response = CLIENT.infer(car_image_path, model_id=model_id)
+    response = CLIENT.infer(car_image_path, model_id="masking-license-plates/1")
     predictions = response.get("predictions", [])
     if not predictions:
         print("No license plates detected in the image.")
         return
 
-    logo_image = cv2.imread(logo_image_path, cv2.IMREAD_UNCHANGED)
-    if logo_image is None:
-        print(f"Error: Could not load logo {logo_image_path}")
+    car_image = cv2.imread(car_image_path)
+    if car_image is None:
+        print("Error loading car image.")
         return
 
-    if car_image.shape[0] < 100 or car_image.shape[1] < 100:
-        print("Warning: The image size is too small to add logos in a visually consistent way.")
+    logo = cv2.imread(logo_path, cv2.IMREAD_UNCHANGED)
+    if logo is None:
+        print("Error loading logo image.")
         return
 
     for pred in predictions:
-        if pred["class"] == "License_Plate":
-            x, y, width, height = int(pred["x"]), int(pred["y"]), int(pred["width"]), int(pred["height"])
-            x1, y1, x2, y2 = x - width // 2, y - height // 2, x + width // 2, y + height // 2
-            x1_padded, y1_padded = max(0, x1 - padding), max(0, y1 - padding)
-            x2_padded, y2_padded = min(car_image.shape[1], x2 + padding), min(car_image.shape[0], y2 + padding)
+        if pred["class"] == "plate":
+            points = np.array([(int(point["x"]), int(point["y"])) for point in pred["points"]])
 
-            car_image[y1_padded:y2_padded, x1_padded:x2_padded] = (255, 255, 255)
+            if len(points) < 4:
+                print("Not enough points to define corners.")
+                continue
 
-            logo_height, logo_width = logo_image.shape[:2]
-            scale_factor = min((x2_padded - x1_padded - 2 * border_thickness) / logo_width,
-                               (y2_padded - y1_padded - 2 * border_thickness) / logo_height)
-            new_logo_width, new_logo_height = int(logo_width * scale_factor), int(logo_height * scale_factor)
+            rect = cv2.minAreaRect(points)
+            box = cv2.boxPoints(rect)
+            box = np.int0(box)
 
-            logo_resized = cv2.resize(logo_image, (new_logo_width, new_logo_height))
+            src_points = np.float32(box)
 
-            bordered_logo = cv2.copyMakeBorder(
-                logo_resized,
-                top=border_thickness,
-                bottom=border_thickness,
-                left=border_thickness,
-                right=border_thickness,
-                borderType=cv2.BORDER_CONSTANT,
-                value=[0, 0, 0]
-            )
+            overlay_w, overlay_h = int(rect[1][0]), int(rect[1][1])
+            white_overlay = np.ones((overlay_h, overlay_w, 3), dtype=np.uint8) * 255
+            dst_points_overlay = np.float32([
+                [0, 0],
+                [overlay_w, 0],
+                [overlay_w, overlay_h],
+                [0, overlay_h]
+            ])
 
-            x_offset = x1_padded + (x2_padded - x1_padded - bordered_logo.shape[1]) // 2
-            y_offset = y1_padded + (y2_padded - y1_padded - bordered_logo.shape[0]) // 2
+            matrix_overlay = cv2.getPerspectiveTransform(dst_points_overlay, src_points)
+            warped_overlay = cv2.warpPerspective(white_overlay, matrix_overlay, (car_image.shape[1], car_image.shape[0]))
 
-            if bordered_logo.shape[2] == 4:
-                alpha_logo = bordered_logo[:, :, 3] / 255.0
-                alpha_car = 1.0 - alpha_logo
+            mask_overlay = cv2.cvtColor(warped_overlay, cv2.COLOR_BGR2GRAY)
+            _, mask_overlay = cv2.threshold(mask_overlay, 1, 255, cv2.THRESH_BINARY)
+            car_image = cv2.bitwise_and(car_image, car_image, mask=cv2.bitwise_not(mask_overlay))
+            car_image = cv2.add(car_image, warped_overlay)
 
-                for c in range(3):
-                    car_image[y_offset:y_offset + bordered_logo.shape[0], x_offset:x_offset + bordered_logo.shape[1], c] = (
-                        alpha_logo * bordered_logo[:, :, c] +
-                        alpha_car * car_image[y_offset:y_offset + bordered_logo.shape[0], x_offset:x_offset + bordered_logo.shape[1], c]
-                    )
+            logo_resized = cv2.resize(logo, (overlay_w, overlay_h), interpolation=cv2.INTER_AREA)
+
+            if logo_resized.shape[2] == 4:
+                logo_mask = logo_resized[:, :, 3]
+                logo_bgr = logo_resized[:, :, :3]
             else:
-                car_image[y_offset:y_offset + bordered_logo.shape[0], x_offset:x_offset + bordered_logo.shape[1]] = bordered_logo
+                logo_mask = np.ones((overlay_h, overlay_w), dtype=np.uint8) * 255
+                logo_bgr = logo_resized
+
+            roi = car_image[int(points[0][1]):int(points[0][1]) + overlay_h, int(points[0][0]):int(points[0][0]) + overlay_w]
+
+            for c in range(0, 3):
+                roi[:, :, c] = roi[:, :, c] * (1 - logo_mask / 255.0) + logo_bgr[:, :, c] * (logo_mask / 255.0)
+
+            car_image[int(points[0][1]):int(points[0][1]) + overlay_h, int(points[0][0]):int(points[0][0]) + overlay_w] = roi
 
     cv2.imwrite(output_image_path, car_image)
     print(f"Output image saved at {output_image_path}")
 
-add_logo_to_license_plates(
-    car_image_path='test-images/car_2.png',
-    logo_image_path='logo/Logo.png',
-    output_image_path='output/cars_with_logo.png'
+add_overlay_only(
+    car_image_path='test-images/car_3.png',
+    output_image_path='output/cars_with_logo_overlay.png',
+    logo_path='logo/Logo.png'
 )
